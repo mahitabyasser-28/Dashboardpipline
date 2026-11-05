@@ -5,25 +5,56 @@ on:
     - cron: "45 7 * * *"      # 09:45 Cairo (UTC+2) — after Claude's 08:31 note review
   workflow_dispatch: {}        # "Run workflow" button
 
+permissions:
+  contents: read
+  pages: write                 # needed to publish to GitHub Pages
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+
       - name: Build dashboard + write All_Notes tab
         env:
           SF_USERNAME: ${{ secrets.SF_USERNAME }}
           SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
-          SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
+          SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN || secrets.SF_TOKEN }}
           SF_DOMAIN: ${{ secrets.SF_DOMAIN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TZ: Africa/Cairo
-        run: python pipeline_health.py
+        run: |
+          rm -f Open_Pipeline_Health_*.html
+          python pipeline_health.py
+
+      - name: Prepare GitHub Pages site (index.html = today's dashboard)
+        run: |
+          mkdir -p site
+          cp "$(ls -t Open_Pipeline_Health_*.html | head -1)" site/index.html
+          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
+          echo "Publishing dashboard $(grep -o '"generated": *"[^"]*"' site/index.html | head -1)"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        name: Publish to GitHub Pages
+        uses: actions/deploy-pages@v4
+
       - uses: actions/upload-artifact@v4
         with:
           name: open-pipeline-health
