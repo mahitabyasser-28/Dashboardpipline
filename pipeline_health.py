@@ -340,7 +340,11 @@ def sheets_client():
         info = json.loads(key) if key else json.load(open(path))
         _GC = gspread.authorize(Credentials.from_service_account_info(info, scopes=scopes))
         return _GC
-    from google.colab import auth            # only inside Colab
+    try:
+        from google.colab import auth        # only inside Colab
+    except ModuleNotFoundError:
+        raise RuntimeError("not in Colab and no service account: set the GOOGLE_SERVICE_ACCOUNT_JSON secret "
+                           "(and share the sheet with that service account's email as Editor)") from None
     auth.authenticate_user()
     from google.auth import default
     creds, _ = default()
@@ -374,12 +378,14 @@ def load_sheet_labels(url=None, tab=None):
     except Exception:
         rows = None
     if rows is None:
+        print("   ℹ️ the sheet's public link didn't work (sheet not shared as 'Anyone with the link can view') "
+              "→ trying Google sign-in / service account")
         try:
             rows = sheets_client().open_by_key(sid).worksheet(tab).get_all_records()
             how = "Google sign-in"
         except Exception as e:
-            print(f"   ⚠️ couldn't read the '{tab}' tab of the labels sheet ({type(e).__name__}: {e}) "
-                  f"→ using built-in / local labels only"); return {}
+            print(f"   ❌ couldn't read the '{tab}' tab of the labels sheet ({e}) "
+                  f"→ only the {len(EMBEDDED_LABELS):,} built-in stances are used, so numbers will NOT match Claude's"); return {}
     labels = _sheet_rows_to_labels(rows)
     last = max((v["reviewed"] for v in labels.values() if v["reviewed"]), default="?")
     print(f"   ☁️ {len(labels):,} reviewed stances from Google Sheets ({how}) · latest review {last}")
