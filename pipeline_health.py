@@ -1,4 +1,4 @@
-#  =====================================================================
+# =====================================================================
 # OPEN OPPORTUNITY HEALTH PIPELINE — ALL SMs · TLs · Sales Reps
 # ---------------------------------------------------------------------
 # WHAT IT DOES
@@ -43,6 +43,31 @@
 #   simple_salesforce connection) just run this file.
 #   Output: Open_Pipeline_Health_<Day><Mon>.html  (e.g. …_2ndNov.html)
 #   Email / share the HTML: it opens in any browser, no login needed.
+#
+# REVIEWED STANCES FROM GOOGLE SHEETS (updated every morning by Claude)
+#   Each daily Claude run reads every new / changed note and writes the full set of
+#   reviewed stances (those not built into this script) to the "Note_Labels" tab of LABELS_SHEET_URL. When you run this
+#   script in Colab it downloads that tab first, so the dashboard uses the same
+#   stances as the published Claude dashboard. Order of precedence:
+#     built-in labels (2026-11-02)  <  Google Sheet  <  local note_labels.json
+#     (a local label only wins if it was reviewed on the same day or later).
+#   The sheet must be shared as "Anyone with the link can view" — or the script
+#   falls back to signing in with your Google account (Colab pop-up).
+#   A note edited AFTER the morning run shows "not reviewed" until the next run.
+#
+# ALL NOTES IN GOOGLE SHEETS
+#   Every run also writes EVERY open opportunity — full note text, stance, summary,
+#   health, rep / TL / SM, stage, amount — to the "All_Notes" tab (ALL_NOTES_TAB).
+#   Writing needs edit access: in Colab you sign in with your Google account; on
+#   GitHub Actions a Google service account (see below) that is an Editor on the sheet.
+#
+# RUNNING IT
+#   · Colab: run your `sf = Salesforce(...)` cell, then this file (as before).
+#   · GitHub Actions / any server: no `sf` needed — set these environment variables
+#       SF_USERNAME, SF_PASSWORD, SF_SECURITY_TOKEN   (SF_DOMAIN = "test" for a sandbox)
+#       GOOGLE_SERVICE_ACCOUNT_JSON  = the service-account key JSON (the whole text)
+#     and run:  python pipeline_health.py
+#   pip install simple-salesforce gspread google-auth
 # =====================================================================
 import json, os, re, sys, html as _html
 from datetime import datetime, date, timedelta, timezone
@@ -69,6 +94,10 @@ TL_SALES_MANAGER_OVERRIDE = {
 
 NOTE_FIELDS = ["Opportunity_Notes__c", "Description"]   # ◀◀ fields read for the client's stance
 NOTE_LABELS_FILE = "note_labels.json"     # ◀◀ reviewed stances (keep next to this script)
+LABELS_SHEET_URL = "https://docs.google.com/spreadsheets/d/1w6Iw8OUTLDlt6qF3YmG1QZbAFwdeDVPkY5BKBXzlKjM/edit"  # ◀◀ None = don't use the sheet
+LABELS_SHEET_TAB = "Note_Labels"          # ◀◀ tab Claude writes every morning
+ALL_NOTES_TAB = "All_Notes"               # ◀◀ tab this script fills with every open opp + full note (None = off)
+SHEET_CELL_MAX = 49000                    # Google Sheets limit is 50,000 characters per cell
 
 CURRENCY = "EGP"
 OPEN_STAGES = None        # ◀◀ None = auto from OpportunityStage (IsClosed = false), in Salesforce order
@@ -279,18 +308,156 @@ def note_hash(note):
     return hashlib.sha1(note.strip().encode("utf-8")).hexdigest()[:12]
 
 
-def load_labels(path=None):
-    """Reviewed labels built into this script, plus (if present) NOTE_LABELS_FILE,
-    which overrides / adds to them — use it for notes reviewed after this version."""
+SHEET_COLS = ["Opportunity ID", "Stance", "Summary", "Note hash", "Reviewed on"]
+
+
+def _sheet_rows_to_labels(rows):
+    valid = {k for k, _l, _h in STANCES} | {NO_NOTES[0]}
+    out = {}
+    for r in rows:
+        oid = str(r.get("Opportunity ID") or "").strip()
+        st = str(r.get("Stance") or "").strip()
+        hh = str(r.get("Note hash") or "").strip()
+        if hh.startswith("h:"): hh = hh[2:]
+        if not oid or st not in valid or not hh: continue
+        out[oid] = {"stance": st, "summary": str(r.get("Summary") or "").strip(), "note_hash": hh,
+                    "reviewed": str(r.get("Reviewed on") or "").strip()}
+    return out
+
+
+_GC = None
+def sheets_client():
+    """gspread client: service account (GOOGLE_SERVICE_ACCOUNT_JSON = key text, or a path in
+    GOOGLE_APPLICATION_CREDENTIALS) → otherwise Colab Google sign-in. Raises if neither works."""
+    global _GC
+    if _GC is not None: return _GC
+    import gspread
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    key = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if key or (path and os.path.exists(path)):
+        from google.oauth2.service_account import Credentials
+        info = json.loads(key) if key else json.load(open(path))
+        _GC = gspread.authorize(Credentials.from_service_account_info(info, scopes=scopes))
+        return _GC
+    from google.colab import auth            # only inside Colab
+    auth.authenticate_user()
+    from google.auth import default
+    creds, _ = default()
+    _GC = gspread.authorize(creds)
+    return _GC
+
+
+def _sheet_id(url):
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", url or "")
+    return m.group(1) if m else None
+
+
+def load_sheet_labels(url=None, tab=None):
+    """Downloads the reviewed stances Claude writes to Google Sheets every morning.
+    1st try: public CSV link (sheet shared 'Anyone with the link can view').
+    2nd try: Colab Google sign-in + gspread. Returns {} if neither works."""
+    import csv, io, urllib.parse, urllib.request
+    url, tab = url or LABELS_SHEET_URL, tab or LABELS_SHEET_TAB
+    if not url: return {}
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", url)
+    if not m:
+        print(f"   ⚠️ LABELS_SHEET_URL doesn't look like a Google Sheet link: {url}"); return {}
+    sid, rows, how = m.group(1), None, ""
+    try:
+        csv_url = (f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv"
+                   f"&sheet={urllib.parse.quote(tab)}&headers=1")
+        txt = urllib.request.urlopen(csv_url, timeout=60).read().decode("utf-8-sig")
+        rows = list(csv.DictReader(io.StringIO(txt)))
+        if not rows or "Opportunity ID" not in rows[0]: rows = None
+        else: how = "public link"
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            rows = sheets_client().open_by_key(sid).worksheet(tab).get_all_records()
+            how = "Google sign-in"
+        except Exception as e:
+            print(f"   ⚠️ couldn't read the '{tab}' tab of the labels sheet ({type(e).__name__}: {e}) "
+                  f"→ using built-in / local labels only"); return {}
+    labels = _sheet_rows_to_labels(rows)
+    last = max((v["reviewed"] for v in labels.values() if v["reviewed"]), default="?")
+    print(f"   ☁️ {len(labels):,} reviewed stances from Google Sheets ({how}) · latest review {last}")
+    return labels
+
+
+def load_labels(path=None, use_sheet=True):
+    """Reviewed labels: built into this script  <  Google Sheet (LABELS_SHEET_URL)  <  NOTE_LABELS_FILE.
+    A local label only overrides the sheet if it was reviewed on the same day or later."""
     labels = {k: {"stance": v[0], "summary": v[1], "note_hash": v[2]} for k, v in EMBEDDED_LABELS.items()}
+    sheet = load_sheet_labels() if use_sheet else {}
+    labels.update(sheet)
     path = path or NOTE_LABELS_FILE
+    n_local = 0
     if path and os.path.exists(path):
         with open(path, encoding="utf-8") as f: extra = json.load(f)
-        labels.update(extra)
-        print(f"   📘 {len(labels):,} reviewed labels ({len(EMBEDDED_LABELS):,} built in + {len(extra):,} from {path})")
-    else:
-        print(f"   📘 {len(labels):,} reviewed labels built into this script (reviewed 2026-11-02)")
+        for k, v in extra.items():
+            if k not in sheet or str(v.get("reviewed", "")) >= sheet[k].get("reviewed", ""):
+                labels[k] = v; n_local += 1
+    print(f"   📘 {len(labels):,} reviewed labels ({len(EMBEDDED_LABELS):,} built in"
+          + (f" + {len(sheet):,} from Google Sheets" if sheet else "")
+          + (f" + {n_local:,} from {path}" if n_local else "") + ")")
     return labels
+
+
+def write_all_notes(opps, rows, meta, url=None, tab=None):
+    """Writes every open opportunity (full note text + stance + hierarchy) to the ALL_NOTES_TAB tab."""
+    url, tab = url or LABELS_SHEET_URL, tab or ALL_NOTES_TAB
+    sid = _sheet_id(url)
+    if not (sid and tab): return
+    try:
+        sh = sheets_client().open_by_key(sid)
+        try: ws = sh.worksheet(tab)
+        except Exception: ws = sh.add_worksheet(title=tab, rows=len(rows) + 10, cols=16)
+        full = {o["Id"]: clean_note("\n".join(str(o.get(x) or "") for x in NOTE_FIELDS if o.get(x))) for o in opps}
+        SL = {k: l for k, l, _h in STANCES + [NO_NOTES]}
+        HN = ["Healthy", "Watch", "At risk"]
+        head = ["Opportunity ID", "Opportunity", "Account", "Sales Manager", "Team Leader", "Sales Rep", "Stage",
+                "Amount", "Expected close", "Days in stage", "Client stance", "Health", "Reviewed",
+                "Where the client stands", "Note (full)", "Refreshed"]
+        order = {"lost": 0, "unresp": 1, "none": 2, "hesit": 3, "wait": 4, "engaged": 5, "book": 6}
+        data = [head]
+        for r in sorted(rows, key=lambda r: (r["sm"], r["tl"], r["rep"], order.get(r["sk"], 9), -r["amt"])):
+            note = full.get(r["id"], "")
+            if len(note) > SHEET_CELL_MAX: note = "…" + note[-SHEET_CELL_MAX:]
+            data.append([r["id"], r["n"], r["a"], r["sm"], r["tl"], r["rep"], r["st"], r["amt"] or 0, r["cd"],
+                         r["dis"], SL.get(r["sk"], r["sk"]), HN[r["h"]], "Yes" if r["rv"] else "Not yet",
+                         r["sum"] or (r["ev"] if not r["rv"] else ""), note, meta["generated"]])
+        ws.clear()
+        if ws.row_count < len(data): ws.add_rows(len(data) - ws.row_count)
+        for i in range(0, len(data), 400):
+            ws.update(values=data[i:i + 400], range_name=f"A{i + 1}", value_input_option="RAW")
+        try: ws.freeze(rows=1)
+        except Exception: pass
+        print(f"   🗂️ {len(data) - 1:,} open opportunities with full notes written to the '{tab}' tab")
+    except Exception as e:
+        print(f"   ⚠️ couldn't write the '{tab}' tab ({type(e).__name__}: {e}) — needs edit access "
+              f"(Colab sign-in, or a service account that is an Editor on the sheet)")
+
+
+def export_labels(opps, labels, out_path):
+    """Writes the reviewed stance of every open opportunity whose note still matches its review
+    and that is NOT already built into this script → CSV with SHEET_COLS
+    (what Claude pastes into the Note_Labels tab every morning)."""
+    import csv
+    n = 0
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(SHEET_COLS)
+        for o in sorted(opps, key=lambda o: o["Id"]):
+            raw = "\n".join(str(o.get(x) or "") for x in NOTE_FIELDS if o.get(x))
+            note = clean_note(raw)
+            lab = labels.get(o["Id"])
+            if not note.strip() or not lab or lab.get("note_hash") != note_hash(note): continue
+            emb = EMBEDDED_LABELS.get(o["Id"])
+            if emb and emb[0] == lab["stance"] and emb[2] == lab["note_hash"]: continue   # already built in
+            w.writerow([o["Id"], lab["stance"], lab.get("summary", ""), "h:" + lab["note_hash"],
+                        lab.get("reviewed") or "2026-11-02"]); n += 1
+    print(f"   📤 {n:,} reviewed stances exported → {os.path.abspath(out_path)}")
 
 
 def build(users, opps, stages, today, base_url="", log=print, labels=None, to_review=None):
@@ -913,15 +1080,53 @@ def main():
                                  "Qualified Negotiating", "Qualified Closing"]
         base = SF_BASE_URL or ""
     else:
-        try:
-            sf  # noqa: F821  — the simple_salesforce connection from your notebook
-        except NameError:
-            print("❌ no Salesforce connection: create `sf = Salesforce(...)` first (same as the EOD tracker)."); return
+        conn = globals().get("sf")             # the simple_salesforce connection from your notebook
+        if conn is None:
+            try:
+                import __main__; conn = getattr(__main__, "sf", None)
+            except Exception: conn = None
+        if conn is None and os.environ.get("SF_USERNAME"):
+            from simple_salesforce import Salesforce
+            conn = Salesforce(username=os.environ["SF_USERNAME"], password=os.environ.get("SF_PASSWORD", ""),
+                              security_token=os.environ.get("SF_SECURITY_TOKEN", ""),
+                              domain=os.environ.get("SF_DOMAIN", "login"))
+            print("🔑 connected to Salesforce from SF_USERNAME / SF_PASSWORD / SF_SECURITY_TOKEN")
+        if conn is None:
+            print("❌ no Salesforce connection: create `sf = Salesforce(...)` first (Colab), "
+                  "or set SF_USERNAME, SF_PASSWORD and SF_SECURITY_TOKEN (GitHub / server)."); sys.exit(1)
         print("⏱ pulling users, open stages and open opportunities…")
-        users, opps, stages, base = fetch(sf)  # noqa: F821
+        users, opps, stages, base = fetch(conn)
     print(f"   {len(opps):,} open opportunities · stages: {stages}")
+    global NOTE_LABELS_FILE
+    if "--labels" in sys.argv:
+        NOTE_LABELS_FILE = sys.argv[sys.argv.index("--labels") + 1]
+    if "--merge-labels" in sys.argv:
+        # CSV columns: Opportunity ID, Stance (book/engaged/wait/hesit/unresp/lost/none), Summary
+        import csv
+        valid = {k for k, _l, _h in STANCES} | {NO_NOTES[0]}
+        by_id = {o["Id"]: o for o in opps}
+        store = {}
+        if os.path.exists(NOTE_LABELS_FILE):
+            with open(NOTE_LABELS_FILE, encoding="utf-8") as f: store = json.load(f)
+        added, bad = 0, []
+        with open(sys.argv[sys.argv.index("--merge-labels") + 1], encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                oid, st = (r.get("Opportunity ID") or "").strip(), (r.get("Stance") or "").strip()
+                if oid not in by_id or st not in valid:
+                    bad.append(oid or "?"); continue
+                raw = "\n".join(str(by_id[oid].get(x) or "") for x in NOTE_FIELDS if by_id[oid].get(x))
+                store[oid] = {"stance": st, "summary": (r.get("Summary") or "").strip(),
+                              "note_hash": note_hash(clean_note(raw)), "reviewed": today.isoformat()}
+                added += 1
+        with open(NOTE_LABELS_FILE, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=0)
+        print(f"   🧾 merged {added:,} reviewed labels into {NOTE_LABELS_FILE}" + (f" · skipped {len(bad)}: {bad[:10]}" if bad else ""))
+    labels = load_labels(use_sheet="--opps" not in sys.argv and "--no-sheet" not in sys.argv)
     to_review = []
-    rows, meta = build(users, opps, stages, today, base, to_review=to_review)
+    rows, meta = build(users, opps, stages, today, base, labels=labels, to_review=to_review)
+    if "--export-labels" in sys.argv:
+        export_labels(opps, labels, sys.argv[sys.argv.index("--export-labels") + 1])
+    if ("--opps" not in sys.argv and "--no-sheet" not in sys.argv) or "--write-all-notes" in sys.argv:
+        write_all_notes(opps, rows, meta)
     if to_review:
         import csv
         rv_out = f"Notes_To_Review_{today:%Y%m%d}.csv"
