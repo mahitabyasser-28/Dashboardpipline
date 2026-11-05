@@ -1,56 +1,32 @@
-name: Pipeline health report
+name: Open Pipeline Health
 
 on:
   schedule:
-    - cron: "0 6 * * *"      # every day 06:00 UTC (≈ 8–9 am Cairo)
-  workflow_dispatch:          # "Run workflow" button on the Actions tab
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
+    - cron: "45 7 * * *"      # 09:45 Cairo (UTC+2) — after Claude's 08:31 note review
+  workflow_dispatch: {}        # "Run workflow" button
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
+          python-version: "3.11"
       - run: pip install -r requirements.txt
-
-      - name: Build report from Salesforce
-        run: python run_report.py
+      - name: Build dashboard + write All_Notes tab
         env:
           SF_USERNAME: ${{ secrets.SF_USERNAME }}
           SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
-          SF_TOKEN: ${{ secrets.SF_TOKEN }}
-
-      - name: Save notes that still need reviewing
-        if: hashFiles('Notes_To_Review_*.csv') != ''
-        uses: actions/upload-artifact@v4
+          SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TZ: Africa/Cairo
+        run: python pipeline_health.py
+      - uses: actions/upload-artifact@v4
         with:
-          name: notes-to-review
-          path: Notes_To_Review_*.csv
-          retention-days: 14
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          name: open-pipeline-health
+          path: |
+            Open_Pipeline_Health_*.html
+            Notes_To_Review_*.csv
+          if-no-files-found: warn
