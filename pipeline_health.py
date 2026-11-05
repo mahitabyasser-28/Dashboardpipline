@@ -1087,9 +1087,17 @@ def main():
             except Exception: conn = None
         if conn is None and os.environ.get("SF_USERNAME"):
             from simple_salesforce import Salesforce
-            conn = Salesforce(username=os.environ["SF_USERNAME"], password=os.environ.get("SF_PASSWORD", ""),
-                              security_token=os.environ.get("SF_SECURITY_TOKEN", ""),
-                              domain=os.environ.get("SF_DOMAIN", "login"))
+            env = {k: (os.environ.get(k) or "").strip() for k in
+                   ("SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN", "SF_DOMAIN")}
+            # show WHICH settings arrived (never their values) so a missing GitHub secret is obvious
+            print("🔎 Salesforce settings: " + " · ".join(
+                f"{k}={'set (' + str(len(v)) + ' chars)' if v else 'MISSING'}" for k, v in env.items()))
+            if env["SF_USERNAME"]: print(f"   username: {env['SF_USERNAME']}")
+            if not env["SF_SECURITY_TOKEN"]:
+                print("   ⚠️ SF_SECURITY_TOKEN is empty — add it under Settings → Secrets and variables → Actions "
+                      "→ Repository secrets (not Environment secrets)")
+            conn = Salesforce(username=env["SF_USERNAME"], password=env["SF_PASSWORD"],
+                              security_token=env["SF_SECURITY_TOKEN"], domain=env["SF_DOMAIN"] or "login")
             print("🔑 connected to Salesforce from SF_USERNAME / SF_PASSWORD / SF_SECURITY_TOKEN")
         if conn is None:
             print("❌ no Salesforce connection: create `sf = Salesforce(...)` first (Colab), "
